@@ -25,6 +25,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -39,7 +40,7 @@ from .errors import (
     ValidationError,
 )
 from .models import FileInfo
-from .parquet_io import now_iso, write_batch, write_merged
+from .parquet_io import now_iso, read_parquet_handle, write_batch, write_merged
 
 try:  # POSIX (the Docker image is Linux)
     import fcntl
@@ -667,6 +668,60 @@ class Registry:
             if row is None:
                 raise NotFoundError("清单中不存在该文件")
             return row["rel_path"], row["bytes"], row["sha256"]
+
+    # -------------------------------------------------------------- geofence
+    def geofence_events(
+        self,
+        *,
+        vehicle_id: str,
+        start: datetime,
+        end: datetime,
+        polygon: list[tuple[float, float]],
+    ) -> dict:
+        """Compute in-fence stays for one vehicle over one consistent snapshot.
+
+        The snapshot is pinned by claiming an internal manifest: the claim
+        transaction fixes exactly which live files this query reads, and the
+        pin stops recycling from unlinking them mid-read.  Concurrent uploads
+        land in *new* files (invisible to this snapshot) and concurrent merges
+        only replace the live list for *later* claims, so the result never
+        mixes files from different snapshots.  The manifest is released
+        before returning; ``file_ids`` in the result reports what was read.
+        """
+        from .geofence import collect_samples, compute_stays
+
+        try:
+            manifest = self.claim(f"geofence:{vehicle_id}")
+        except ConflictError:
+            # No live files at this serial moment: an empty but consistent
+            # snapshot, not an error, for a read-only query.
+            return {"file_ids": [], "samples": [], "stays": []}
+        manifest_id = manifest["manifest_id"]
+        try:
+            file_ids: list[str] = []
+            samples: list[tuple[datetime, float, float]] = []
+            for item in manifest["files"]:
+                handle, _size, _sha, _name = self.open_for_download(
+                    manifest_id, item["file_id"]
+                )
+                try:
+                    table = read_parquet_handle(handle)
+                finally:
+                    handle.close()
+                file_ids.append(item["file_id"])
+                samples.extend(collect_samples(table, vehicle_id, start, end))
+            # Stable sort: ties keep (file ordinal, row) order, so stitching
+            # adjacent points across files is deterministic.
+            samples.sort(key=lambda sample: sample[0])
+            stays = compute_stays(samples, polygon)
+            return {"file_ids": file_ids, "samples": samples, "stays": stays}
+        finally:
+            try:
+                self.release(manifest_id)
+            except Exception as exc:  # best effort: never mask the result
+                print(
+                    f"warning: geofence snapshot {manifest_id} release failed: {exc}"
+                )
 
     # ----------------------------------------------------------- maintenance
     def recycle_retired(self) -> int:

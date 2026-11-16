@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, field_validator, model_validator
 
 
 class FileInfo(BaseModel):
@@ -92,3 +93,67 @@ class HealthResponse(BaseModel):
     status: str
     instance_id: str
     root: str
+
+
+# ------------------------------------------------------------------ geofence
+class GeoPoint(BaseModel):
+    lat: float = Field(ge=-90.0, le=90.0, description="纬度（WGS-84）")
+    lon: float = Field(ge=-180.0, le=180.0, description="经度（WGS-84）")
+
+
+class GeofenceEventsRequest(BaseModel):
+    """One geofence query: fence polygon + vehicle + inclusive UTC window."""
+
+    vehicle_id: str = Field(
+        min_length=1, max_length=256, description="要查询的车辆号（精确匹配）"
+    )
+    start: AwareDatetime = Field(description="时间窗起点（UTC，含边界）")
+    end: AwareDatetime = Field(description="时间窗终点（UTC，含边界）")
+    polygon: list[GeoPoint] = Field(
+        description=(
+            "闭合围栏多边形的顶点（按顺序）。首尾顶点相同时会自动去重；"
+            "边界上的点按在围栏内处理"
+        ),
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _normalize_to_utc(cls, value: datetime) -> datetime:
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def _check_window(self) -> GeofenceEventsRequest:
+        if self.end < self.start:
+            raise ValueError("end 必须不早于 start")
+        return self
+
+
+class GeofenceEvent(BaseModel):
+    entered_at: str | None = Field(
+        description="观测到进入的时刻（该区间首个围栏内点）；null 表示时间窗开始时车辆已在围栏内"
+    )
+    left_at: str | None = Field(
+        description="观测到离开的时刻（该区间之后首个围栏外点）；null 表示时间窗结束时车辆仍在围栏内"
+    )
+    first_inside_at: str = Field(description="该区间首个围栏内观测点")
+    last_inside_at: str = Field(description="该区间最后一个围栏内观测点")
+    inside_points: int = Field(description="该区间内的围栏内观测点数")
+    closed: bool = Field(
+        description="进入与离开都被观测到；false 即为未闭合区间"
+    )
+
+
+class GeofenceEventsResponse(BaseModel):
+    vehicle_id: str
+    start: str = Field(description="实际使用的查询窗口起点（UTC）")
+    end: str = Field(description="实际使用的查询窗口终点（UTC）")
+    file_ids: list[str] = Field(
+        description="本次查询读取的一致性快照文件 ID（内部领取的固定清单，查询结束已释放）"
+    )
+    snapshot_file_count: int = Field(description="快照中的文件件数")
+    matched_points: int = Field(description="窗口内该车辆的观测点总数")
+    inside_points: int = Field(description="窗口内该车辆位于围栏内的观测点数")
+    events: list[GeofenceEvent] = Field(
+        description="按时间顺序的围栏内停留区间；连续停留只生成一个区间"
+    )
+    unclosed_count: int = Field(description="未闭合区间（closed=false）的数量")

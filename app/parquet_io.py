@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import BinaryIO
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -125,6 +126,15 @@ def write_batch(
 
 def read_parquet(path: Path) -> pa.Table:
     return pq.read_table(path)
+
+
+def read_parquet_handle(handle: BinaryIO) -> pa.Table:
+    """Read a table from an already-open binary descriptor.
+
+    Used by snapshot readers that pin the file through an open manifest: the
+    descriptor stays readable even if another job recycles the file name.
+    """
+    return pq.read_table(handle)
 
 
 def write_merged(

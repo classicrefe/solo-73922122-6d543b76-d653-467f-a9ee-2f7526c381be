@@ -155,7 +155,7 @@ def main() -> int:
     claimed: list[dict] = []
     lock = threading.Lock()
 
-    print("[1/6] 并发上传小批轨迹（两个实例交替）…")
+    print("[1/7] 并发上传小批轨迹（两个实例交替）…")
     base_rows = []
     for index in range(6):
         rows = make_rows(1000 + index, 12 + index, run_id)
@@ -163,7 +163,7 @@ def main() -> int:
         base_rows.extend(rows)
     print(f"      uploaded {len(base_rows)} rows in 6 batches")
 
-    print("[2/6] 领取清单，然后合并并继续上传…")
+    print("[2/7] 领取清单，然后合并并继续上传…")
     _, manifest = claim(f"{args.base_url}")
     with lock:
         claimed.append(manifest)
@@ -176,7 +176,7 @@ def main() -> int:
     upload(uploaders[1], f"demo-{run_id}-late-1", late_rows_b)
     late_rows.extend(late_rows_b)
 
-    print("[3/6] 两个实例并发合并/领取/上传，校验不丢不重…")
+    print("[3/7] 两个实例并发合并/领取/上传，校验不丢不重…")
     def churn(seed: int) -> None:
         rng = random.Random(seed)
         index = 0
@@ -214,7 +214,7 @@ def main() -> int:
         return 1
     print(f"      {len(claimed)} manifests claimed during churn")
 
-    print("[4/6] 旧清单在合并与领取后仍逐件可下载…")
+    print("[4/7] 旧清单在合并与领取后仍逐件可下载…")
     for item in claimed[0]["files"]:
         status, payload = _request("GET", f"{args.base_url}{item['download_path']}")
         digest = hashlib.sha256(payload).hexdigest()
@@ -223,7 +223,7 @@ def main() -> int:
             return 1
     print("      pinned files still readable, hashes match")
 
-    print("[5/6] 最终清单必须包含每条原始记录恰一次…")
+    print("[5/7] 最终清单必须包含每条原始记录恰一次…")
     _, final_manifest = claim(f"{args.peer_url}")
     downloaded = []
     for item in final_manifest["files"]:
@@ -263,7 +263,7 @@ def main() -> int:
         f"this run's {len(expected_all)} rows each appear exactly once"
     )
 
-    print("[6/6] 释放全部清单（幂等）…")
+    print("[6/7] 释放全部清单（幂等）…")
     released = set()
     for item in claimed + [final_manifest]:
         if item["manifest_id"] in released:
@@ -286,6 +286,84 @@ def main() -> int:
     if not stale:
         print("      expected the superseded merge inputs to have been reclaimed")
         return 1
+
+    print("[7/7] 围栏事件：唯一车辆穿越闭合围栏，校验进出区间与快照文件…")
+    geo_vehicle = f"GEO-{run_id}"
+    geo_base = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    # Fence: lat in [40, 41], lon in [10, 11].  Track: outside -> on the
+    # boundary (counts as inside) -> inside -> inside -> outside -> inside
+    # (still inside when the window ends, i.e. an unclosed interval).
+    track = [
+        (0, 39.5, 10.5),
+        (60, 40.0, 10.5),
+        (120, 40.5, 10.5),
+        (180, 40.9, 10.9),
+        (240, 41.5, 10.5),
+        (300, 40.5, 10.5),
+    ]
+    geo_rows = [
+        (
+            geo_vehicle,
+            (geo_base + timedelta(seconds=offset)).isoformat().replace("+00:00", "Z"),
+            lat,
+            lon,
+        )
+        for offset, lat, lon in track
+    ]
+    upload(args.base_url, f"demo-{run_id}-geo", geo_rows)
+    import json
+
+    geo_body = json.dumps(
+        {
+            "vehicle_id": geo_vehicle,
+            "start": "2026-04-01T00:00:00Z",
+            "end": "2026-04-01T00:10:00Z",
+            "polygon": [
+                {"lat": 40.0, "lon": 10.0},
+                {"lat": 40.0, "lon": 11.0},
+                {"lat": 41.0, "lon": 11.0},
+                {"lat": 41.0, "lon": 10.0},
+                {"lat": 40.0, "lon": 10.0},
+            ],
+        }
+    ).encode()
+    # Query the *peer* instance: the snapshot must be consistent across the
+    # shared volume no matter which instance serves the request.
+    _, events = _request(
+        "POST",
+        f"{args.peer_url}/v1/geofence/events",
+        data=geo_body,
+        headers={"Content-Type": "application/json"},
+    )
+    if events["matched_points"] != len(track):
+        print(f"      expected {len(track)} matched points, got {events['matched_points']}")
+        return 1
+    if not events["file_ids"]:
+        print("      geofence response did not report the snapshot file ids")
+        return 1
+    stays = events["events"]
+    if len(stays) != 2 or events["unclosed_count"] != 1:
+        print(f"      expected 2 intervals (1 unclosed), got {stays}")
+        return 1
+    first, second = stays
+    if (
+        first["entered_at"] != _ts_text(geo_rows[1][1])
+        or first["left_at"] != _ts_text(geo_rows[4][1])
+        or not first["closed"]
+    ):
+        print(f"      first interval mismatch: {first}")
+        return 1
+    if (
+        second["entered_at"] != _ts_text(geo_rows[5][1])
+        or second["left_at"] is not None
+        or second["closed"]
+    ):
+        print(f"      second interval mismatch: {second}")
+        return 1
+    print(
+        f"      {len(stays)} intervals over {events['snapshot_file_count']} snapshot "
+        f"files ({events['matched_points']} points, boundary point counted as inside)"
+    )
     return 0
 
 

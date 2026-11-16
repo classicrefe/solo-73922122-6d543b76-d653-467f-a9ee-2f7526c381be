@@ -2,7 +2,9 @@ name: trajectory-lake
 
 # Two API instances share one named volume.  Every piece of state that must be
 # visible to both instances lives on that volume: the Parquet files, the
-# SQLite registry and the cross-instance merge lock.
+# SQLite registry and the cross-instance merge lock.  Both instances serve the
+# geofence endpoint (POST /v1/geofence/events) from the same shared snapshot,
+# so a query can hit either port and observe the same file set.
 services:
   lake-a:
     build: .
@@ -17,6 +19,12 @@ services:
       - "8080:8000"
     restart: unless-stopped
     stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   lake-b:
     build: .
@@ -31,6 +39,12 @@ services:
       - "8081:8000"
     restart: unless-stopped
     stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
 volumes:
   lake-data:
